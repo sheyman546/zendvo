@@ -1,5 +1,29 @@
 # StableRoute — Storage Model & DataKey Reference
 
+## Savings module overview
+
+The savings data model (added in Issue #298) tracks each user's deposited capital
+(**principal**) separately from the yield it has generated (**yield_earned**). Two
+new `DataKey` variants were added: `SavingsAccount(Address)` (per-user) and
+`SavingsConfig` (singleton). The `SavingsConfig` slot holds the annual yield rate
+(in basis points) plus aggregate totals across all users. Design decisions:
+
+- **Principal is sacred** — deposits are always credited to principal; withdrawals
+  debit yield_earned before touching principal. Yield accrual never modifies
+  principal.
+- **Yield is time-based** — accrued via `principal * rate * elapsed / (YEAR_SECS * 10_000)`,
+  using `u128` intermediates to avoid overflow. The `load_savings_with_accrual`
+  helper returns an up-to-date snapshot without writing to storage; callers must
+  invoke `accrue_yield` explicitly to persist.
+- **Slot cleanup** — when a user's entire balance (principal + yield) is withdrawn,
+  their `SavingsAccount` slot is removed entirely, keeping storage lean.
+- **Read-only view** — `get_savings_info` computes pending yield ephemerally and
+  returns it to the caller without writing, so gas-free dashboard queries are
+  always current.
+- **Event-driven** — every state-changing savings entrypoint (`init_savings`,
+  `deposit_savings`, `withdraw_savings`, `accrue_yield`, `set_yield_rate`) emits
+  its own typed event so indexers can track principal and yield movements.
+
 Authoritative reference for the router's on-chain storage
 ([`src/lib.rs`](../src/lib.rs)). Every `DataKey` variant is listed with its key
 shape, value type, storage tier, default-when-absent, the entrypoints that
@@ -22,7 +46,7 @@ read/write it, and its TTL class. Defaults are cross-checked against the
 
 ## Storage tier
 
-All twenty `DataKey` slots live in **persistent** storage; the contract uses
+All twenty-two `DataKey` slots live in **persistent** storage; the contract uses
 no instance or temporary storage today. Persistent entries are subject to
 state archival once their TTL lapses: a pair configured long ago but not
 routed recently can have its entries archived and must be restored (bumped)
@@ -39,8 +63,10 @@ before use.
 The primary TTL mitigation is the natural write frequency of hot slots: every
 `compute_route_fee` call extends the TTL of `TotalRoutesAllTime`,
 `PairLastRouteAt`, `PairRouteCount`, `PairVolume`, and (when set)
-`PairLiquidity`. The `ReentrancyLock` is also written per-route. For
-infrequently-routed pairs, a dedicated TTL-extension ("bump") pass on
+`PairLiquidity`. The `ReentrancyLock` is also written per-route.
+`SavingsAccount` slots are refreshed on every user action (deposit, withdraw,
+accrue), so active savers' entries stay live. For infrequently-routed pairs
+or dormant savings accounts, a dedicated TTL-extension ("bump") pass on
 persistent keys is the reference mitigation.
 
 ## DataKey table
@@ -60,6 +86,18 @@ persistent keys is the reference mitigation.
 | `TotalRoutesAllTime` | `u64` | persistent | **Hot** | `0` | `get_total_routes_all_time` | `compute_route_fee` (saturating `+1`) |
 | `SchemaVersion` | `u32` | persistent | **Static** | `1` (implicit v1) | `get_schema_version` | `migrate_v1_to_v2` |
 | `ReentrancyLock` | `bool` | persistent | **Hot** | `false` | `enter_nonreentrant` | `enter_nonreentrant` (→ `true`), `exit_nonreentrant` (→ `false`) |
+| `SavingsConfig` | `SavingsConfig` | persistent | **Config** | `None` → `SavingsNotInitialized` (#21) | `get_savings_config`, `require_savings_initialized`, `deposit_savings`, `withdraw_savings`, `accrue_yield` | `init_savings`; updated by `set_yield_rate`, `deposit_savings`, `withdraw_savings`, `accrue_yield` |
+
+### Per-user savings slots — `SavingsAccount(Address)`
+
+| DataKey | Value type | Tier | TTL class | Default when absent | Read by | Written by |
+|---|---|---|---|---|---|---|
+| `SavingsAccount(Address)` | `SavingsInfo` | persistent | **Config**† | `None` — no account for that address | `get_savings_info`, `load_savings_with_accrual` (in `deposit_savings`, `withdraw_savings`, `accrue_yield`) | `deposit_savings` (create/update), `withdraw_savings` (update/remove), `accrue_yield` (update) |
+
+† Savings accounts are written on each user action (deposit, withdraw, accrue),
+which is less frequent than route hot slots but more frequent than governance
+config. Classified **Config** because the write frequency depends on user
+behaviour rather than protocol activity.
 
 ### Per-pair slots — `(Symbol, Symbol)`
 

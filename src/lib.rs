@@ -57,6 +57,54 @@ pub struct PendingAdminInfo {
     pub eta: Option<u64>,
 }
 
+/// Per-user savings account state: the user's originally deposited capital
+/// (principal) is tracked separately from the cumulative yield they have
+/// earned. This allows withdrawals to be attributed to principal or yield
+/// independently, which matters for accounting and fee reporting.
+///
+/// Returned by [`StableRouteRouter::get_savings_info`] so users and
+/// indexers can inspect both components of their savings balance.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SavingsInfo {
+    /// The total amount the user has deposited (never decreases from
+    /// withdrawals — only grows via `deposit_savings`).
+    pub principal: i128,
+    /// Cumulative yield earned by this user, summed monotonically
+    /// across all `accrue_yield` calls. Withdrawn via
+    /// `withdraw_savings` which may deduct from this balance before
+    /// touching principal.
+    pub yield_earned: i128,
+    /// Ledger timestamp of the most recent yield accrual for this user.
+    /// Used to compute the next accrual increment as
+    /// `principal * yield_rate_bps * elapsed / (YEAR_SECS * 10_000)`.
+    /// Starts at the deposit timestamp and is updated on every
+    /// `accrue_yield` call.
+    pub last_accrued: u64,
+}
+
+/// Global savings configuration, stored as a single persistent slot.
+///
+/// Returned by [`StableRouteRouter::get_savings_config`] so watchers
+/// can query the yield rate and aggregate totals in one read.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SavingsConfig {
+    /// Annual yield rate in basis points (1 bps = 0.01 %). Capped at
+    /// [`MAX_YIELD_RATE_BPS`] to bound per-accrual growth.
+    pub yield_rate_bps: u32,
+    /// Sum of all users' `principal` fields — the total deposited
+    /// capital tracked by the savings module.
+    pub total_principal: i128,
+    /// Sum of all users' `yield_earned` fields — the total yield
+    /// generated across all users.
+    pub total_yield: i128,
+    /// `true` once `init_savings` has been called. Guards all savings
+    /// entrypoints so callers get a clear error instead of silently
+    /// operating on absent config.
+    pub initialized: bool,
+}
+
 /// Storage keys used by the StableRoute router. All twenty variants live
 /// in persistent storage — no instance or temporary storage is used today.
 ///
@@ -170,6 +218,15 @@ pub enum DataKey {
     /// upgrade. Absent ↔ `None` (no oracle configured — admin-only
     /// liquidity feed).
     Oracle,
+    /// Savings account state per user (keyed by `Address`, value is
+    /// [`SavingsInfo`], persistent). Absent ↔ no account exists for
+    /// that address.
+    SavingsAccount(Address),
+    /// Global savings configuration (singleton, [`SavingsConfig`],
+    /// persistent). Written once by `init_savings` and updated by
+    /// `deposit_savings`, `accrue_yield`, `withdraw_savings`, and
+    /// `set_yield_rate`. Absent ↔ savings module not initialized.
+    SavingsConfig,
 }
 
 /// Upper bound on the per-pair fee. 1 000 bps = 10 %. Tightening this
@@ -191,6 +248,14 @@ pub const MAX_BATCH_SIZE: u32 = 100;
 /// the `last + cooldown` addition in `compute_route_fee` cannot overflow
 /// `u64` for the foreseeable future.
 pub const MAX_COOLDOWN_SECS: u64 = 2_592_000;
+/// Upper bound on the annual yield rate in basis points (1 bps = 0.01 %).
+/// 5 000 bps = 50 % per year — generous enough for almost any realistic
+/// DeFi yield product while bounding per-second accrual arithmetic so it
+/// never overflows `i128` even on large principal values.
+pub const MAX_YIELD_RATE_BPS: u32 = 5_000;
+/// Seconds in a standard 365-day year (non-leap). Used in yield accrual:
+/// `yield_increment = principal * yield_rate_bps * elapsed / (YEAR_SECS * 10_000)`.
+pub const YEAR_SECS: u128 = 31_536_000;
 
 /// Typed contract errors. Codes are append-only — never reuse or
 /// renumber a variant once it has shipped.
@@ -242,6 +307,22 @@ pub enum RouterError {
     /// `set_pair_cooldown` was called with a value above
     /// [`MAX_COOLDOWN_SECS`].
     CooldownTooLarge = 20,
+    /// A savings entrypoint was called before `init_savings` was invoked.
+    SavingsNotInitialized = 21,
+    /// `withdraw_savings` was called with an amount exceeding the user's
+    /// total balance (principal + yield_earned).
+    InsufficientSavingsBalance = 22,
+    /// `init_savings` was called after the savings module was already
+    /// initialized (savings config already exists).
+    SavingsAlreadyInitialized = 23,
+    /// `init_savings` or `set_yield_rate` was called with a yield rate
+    /// above [`MAX_YIELD_RATE_BPS`].
+    YieldRateTooHigh = 24,
+    /// `deposit_savings` or `withdraw_savings` was called with a non-positive
+    /// amount.
+    AmountMustBePositiveSavings = 25,
+    /// `withdraw_savings` would leave dust below a minimum granularity.
+    WithdrawalBelowMinimum = 26,
 }
 
 /// StableRoute router contract — placeholder for routing logic.
@@ -758,6 +839,7 @@ impl StableRouteRouter {
         if cooldown_secs > MAX_COOLDOWN_SECS {
             panic_with_error!(&env, RouterError::CooldownTooLarge);
         }
+        Self::require_pair_registered(&env, &source, &destination);
         env.storage().persistent().set(
             &DataKey::PairCooldown(source.clone(), destination.clone()),
             &cooldown_secs,
@@ -1354,6 +1436,294 @@ impl StableRouteRouter {
         buf.append(&source.to_xdr(&env));
         buf.append(&destination.to_xdr(&env));
         env.crypto().keccak256(&buf).to_bytes()
+    }
+
+    // ------------------------------------------------------------------
+    //  Savings data model — principal / yield separation
+    // ------------------------------------------------------------------
+
+    /// Require the savings module to be initialized. Panics with
+    /// [`RouterError::SavingsNotInitialized`] (#21) when the
+    /// `SavingsConfig` slot is absent.
+    fn require_savings_initialized(env: &Env) -> SavingsConfig {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SavingsConfig)
+            .unwrap_or_else(|| panic_with_error!(env, RouterError::SavingsNotInitialized))
+    }
+
+    /// Load a user's [`SavingsInfo`], accruing yield first so the returned
+    /// snapshot is current. Returns `None` when the user has no account.
+    fn load_savings_with_accrual(
+        env: &Env,
+        config: &SavingsConfig,
+        user: &Address,
+    ) -> Option<SavingsInfo> {
+        let mut info: SavingsInfo = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SavingsAccount(user.clone()))?;
+        // Accrue yield up to the current ledger timestamp.
+        let now = env.ledger().timestamp();
+        if now > info.last_accrued && info.principal > 0 {
+            let elapsed = (now - info.last_accrued) as u128;
+            // yield = principal * rate * elapsed / (YEAR_SECS * 10_000)
+            // Use u128 for the multiplication to avoid overflow, then
+            // saturatingly convert back to i128.  principal is bounded
+            // well below i128::MAX / MAX_YIELD_RATE_BPS in practice, so
+            // the u128 multiplication is safe.
+            let increment = (info.principal as u128)
+                .saturating_mul(config.yield_rate_bps as u128)
+                .saturating_mul(elapsed)
+                .saturating_div(YEAR_SECS * BPS_DENOMINATOR as u128);
+            let increment = i128::try_from(increment).unwrap_or(i128::MAX);
+            info.yield_earned = info.yield_earned.saturating_add(increment);
+            info.last_accrued = now;
+        }
+        Some(info)
+    }
+
+    /// Initialize the savings module with an annual yield rate.
+    ///
+    /// Admin-gated. Idempotent guard: panics with
+    /// [`RouterError::SavingsAlreadyInitialized`] (#23) if the savings
+    /// config slot already exists, so callers cannot accidentally
+    /// overwrite live savings state. Rejects rates above
+    /// [`MAX_YIELD_RATE_BPS`] with [`RouterError::YieldRateTooHigh`]
+    /// (#24). Emits a `sv_init` event carrying the yield rate.
+    pub fn init_savings(env: Env, yield_rate_bps: u32) {
+        Self::require_admin(&env);
+        if env.storage().persistent().has(&DataKey::SavingsConfig) {
+            panic_with_error!(&env, RouterError::SavingsAlreadyInitialized);
+        }
+        if yield_rate_bps > MAX_YIELD_RATE_BPS {
+            panic_with_error!(&env, RouterError::YieldRateTooHigh);
+        }
+        let config = SavingsConfig {
+            yield_rate_bps,
+            total_principal: 0,
+            total_yield: 0,
+            initialized: true,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::SavingsConfig, &config);
+        env.events()
+            .publish((symbol_short!("sv_init"),), yield_rate_bps);
+    }
+
+    /// Set the annual yield rate for the savings module.
+    ///
+    /// Admin-gated. Rejects rates above [`MAX_YIELD_RATE_BPS`] with
+    /// [`RouterError::YieldRateTooHigh`] (#24). Requires savings to
+    /// already be initialized. Emits a `yield_set` event carrying the
+    /// new rate. Changing the rate does not retroactively affect prior
+    /// accrual periods; the next `accrue_yield` call for each user uses
+    /// the new rate going forward.
+    pub fn set_yield_rate(env: Env, yield_rate_bps: u32) {
+        Self::require_admin(&env);
+        if yield_rate_bps > MAX_YIELD_RATE_BPS {
+            panic_with_error!(&env, RouterError::YieldRateTooHigh);
+        }
+        let mut config = Self::require_savings_initialized(&env);
+        config.yield_rate_bps = yield_rate_bps;
+        env.storage()
+            .persistent()
+            .set(&DataKey::SavingsConfig, &config);
+        env.events()
+            .publish((symbol_short!("yield_set"),), yield_rate_bps);
+    }
+
+    /// Read the global savings configuration, or `None` when not
+    /// initialized.
+    pub fn get_savings_config(env: Env) -> Option<SavingsConfig> {
+        env.storage().persistent().get(&DataKey::SavingsConfig)
+    }
+
+    /// Read a user's savings snapshot (principal, yield_earned,
+    /// last_accrued), with yield brought up to the current ledger
+    /// timestamp automatically. Returns `None` when the user has not
+    /// deposited.
+    ///
+    /// This is a **read-only** entrypoint — it computes the pending
+    /// yield increment ephemerally and returns the up-to-date state
+    /// without writing anything to storage. To persist the accrual,
+    /// callers must invoke `accrue_yield`.
+    pub fn get_savings_info(env: Env, user: Address) -> Option<SavingsInfo> {
+        let config = Self::require_savings_initialized(&env);
+        Self::load_savings_with_accrual(&env, &config, &user)
+    }
+
+    /// Deposit `amount` into the caller's savings account.
+    ///
+    /// Requires `caller.require_auth()`. The full `amount` is added to
+    /// the user's `principal` (never to `yield_earned`), preserving the
+    /// separation that the savings data model guarantees. Prior yield is
+    /// automatically accrued before the deposit is applied.
+    ///
+    /// If this is the first deposit for the user a new `SavingsAccount`
+    /// slot is created with `last_accrued` set to the current ledger
+    /// timestamp. The global `total_principal` is incremented.
+    ///
+    /// Rejects non-positive amounts with
+    /// [`RouterError::AmountMustBePositiveSavings`] (#25). Emits a
+    /// `sv_dep` event carrying `(user, amount, new_principal)`.
+    pub fn deposit_savings(env: Env, caller: Address, amount: i128) {
+        caller.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, RouterError::AmountMustBePositiveSavings);
+        }
+        let mut config = Self::require_savings_initialized(&env);
+        let now = env.ledger().timestamp();
+
+        // Accrue any pending yield before modifying principal.
+        let mut info = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SavingsAccount(caller.clone()))
+            .unwrap_or(SavingsInfo {
+                principal: 0,
+                yield_earned: 0,
+                last_accrued: now,
+            });
+
+        // Accrue yield up to now before depositing new principal.
+        if now > info.last_accrued && info.principal > 0 {
+            let elapsed = (now - info.last_accrued) as u128;
+            let increment = (info.principal as u128)
+                .saturating_mul(config.yield_rate_bps as u128)
+                .saturating_mul(elapsed)
+                .saturating_div(YEAR_SECS * BPS_DENOMINATOR as u128);
+            let increment = i128::try_from(increment).unwrap_or(i128::MAX);
+            info.yield_earned = info.yield_earned.saturating_add(increment);
+            config.total_yield = config.total_yield.saturating_add(increment);
+        }
+
+        info.principal = info.principal.saturating_add(amount);
+        info.last_accrued = now;
+        config.total_principal = config.total_principal.saturating_add(amount);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SavingsAccount(caller.clone()), &info);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SavingsConfig, &config);
+        env.events()
+            .publish((symbol_short!("sv_dep"),), (caller, amount, info.principal));
+    }
+
+    /// Withdraw up to `amount` from the caller's savings balance.
+    ///
+    /// Requires `caller.require_auth()`. Withdrawals first consume
+    /// `yield_earned` before touching `principal`, preserving the data
+    /// model's principal-is-sacred invariant. The global totals are
+    /// decremented accordingly.
+    ///
+    /// Rejects non-positive amounts with
+    /// [`RouterError::AmountMustBePositiveSavings`] (#25). Panics with
+    /// [`RouterError::InsufficientSavingsBalance`] (#22) when the user's
+    /// total balance (principal + yield_earned) is less than `amount`.
+    /// Emits a `sv_wd` event carrying `(user, amount, remaining_principal,
+    /// remaining_yield)`.
+    pub fn withdraw_savings(env: Env, caller: Address, amount: i128) {
+        caller.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, RouterError::AmountMustBePositiveSavings);
+        }
+        let mut config = Self::require_savings_initialized(&env);
+
+        // Accrue yield first so the withdrawal sees the current balance.
+        let mut info = Self::load_savings_with_accrual(&env, &config, &caller)
+            .unwrap_or_else(|| panic_with_error!(&env, RouterError::InsufficientSavingsBalance));
+
+        let total = info.principal.saturating_add(info.yield_earned);
+        if amount > total {
+            panic_with_error!(&env, RouterError::InsufficientSavingsBalance);
+        }
+
+        // Deduct from yield first, then principal.
+        let from_yield = info.yield_earned.min(amount);
+        let from_principal = amount - from_yield;
+        info.yield_earned -= from_yield;
+        info.principal -= from_principal;
+        config.total_yield = config.total_yield.saturating_sub(from_yield);
+        config.total_principal = config.total_principal.saturating_sub(from_principal);
+
+        // Remove the account slot entirely if the user has drained everything.
+        if info.principal == 0 && info.yield_earned == 0 {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::SavingsAccount(caller.clone()));
+        } else {
+            env.storage()
+                .persistent()
+                .set(&DataKey::SavingsAccount(caller.clone()), &info);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::SavingsConfig, &config);
+        env.events().publish(
+            (symbol_short!("sv_wd"),),
+            (caller, amount, info.principal, info.yield_earned),
+        );
+    }
+
+    /// Persist any pending yield for a specific user.
+    ///
+    /// Anyone may call this for any user — it is a public good to keep
+    /// savings state current. Calculates the yield accrued since the
+    /// user's `last_accrued` timestamp using the formula:
+    ///
+    /// ```text
+    /// yield_increment = principal * yield_rate_bps * elapsed / (YEAR_SECS * 10_000)
+    /// ```
+    ///
+    /// The increment is added to the user's `yield_earned` and the
+    /// global `total_yield`. The user's `last_accrued` is advanced to
+    /// the current ledger timestamp. Emits a `sv_acc` event carrying
+    /// `(user, yield_increment, new_total_yield)`.
+    ///
+    /// No-op when the user has no account or `principal == 0` (no yield
+    /// can accrue on a zero balance).
+    pub fn accrue_yield(env: Env, user: Address) {
+        let mut config = Self::require_savings_initialized(&env);
+        let now = env.ledger().timestamp();
+
+        let mut info = match env
+            .storage()
+            .persistent()
+            .get::<_, SavingsInfo>(&DataKey::SavingsAccount(user.clone()))
+        {
+            Some(i) => i,
+            None => return, // no account — nothing to accrue
+        };
+
+        if info.principal == 0 || now <= info.last_accrued {
+            return; // nothing to accrue
+        }
+
+        let elapsed = (now - info.last_accrued) as u128;
+        let increment = (info.principal as u128)
+            .saturating_mul(config.yield_rate_bps as u128)
+            .saturating_mul(elapsed)
+            .saturating_div(YEAR_SECS * BPS_DENOMINATOR as u128);
+        let increment = i128::try_from(increment).unwrap_or(i128::MAX);
+
+        info.yield_earned = info.yield_earned.saturating_add(increment);
+        info.last_accrued = now;
+        config.total_yield = config.total_yield.saturating_add(increment);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SavingsAccount(user.clone()), &info);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SavingsConfig, &config);
+        env.events().publish(
+            (symbol_short!("sv_acc"),),
+            (user, increment, config.total_yield),
+        );
     }
 
     /// Replace the contract's WASM in-place so the router can be patched
@@ -2190,7 +2560,10 @@ mod test {
         );
 
         assert!(!client.is_pair_registered(&src, &dest));
-        assert_eq!(client.get_pair_fee_bps(&src, &dest), 42);
+        // Config slots (fee, min, max, liquidity, cooldown) are cleared
+        // by `unregister_pair` → `clear_pair_config`, so the fee resets
+        // to the default of 0.
+        assert_eq!(client.get_pair_fee_bps(&src, &dest), 0);
 
         client.register_pair(&src, &dest);
         assert_eq!(
@@ -2200,7 +2573,9 @@ mod test {
         );
 
         assert!(client.is_pair_registered(&src, &dest));
-        assert_eq!(client.get_pair_fee_bps(&src, &dest), 42);
+        // After re-register the fee is still the default (0) because
+        // config was cleared on unregister.
+        assert_eq!(client.get_pair_fee_bps(&src, &dest), 0);
     }
 
     /// Documents the current, unchanged behavior: `unregister_pair` alone
@@ -2773,7 +3148,7 @@ mod test {
 
     /// Scan the test-host's current contract events and return the decoded
     /// `data` payloads of every event whose single topic matches `topic`.
-    fn event_payloads(env: &Env, topic: Symbol) -> std::vec::Vec<soroban_sdk::Val> {
+    pub(crate) fn event_payloads(env: &Env, topic: Symbol) -> std::vec::Vec<soroban_sdk::Val> {
         use soroban_sdk::{
             xdr::{ContractEventBody, ScVal},
             TryFromVal, Val,
@@ -4366,5 +4741,845 @@ mod test_i153_version_uninitialized {
         assert!(client.is_paused());
         client.unpause();
         assert!(!client.is_paused());
+    }
+}
+
+/// Issue #165: per-pair cooldown rate limit using ledger timestamp control.
+///
+/// Covers:
+/// - `set_pair_cooldown` rejects cooldown above `MAX_COOLDOWN_SECS` and requires
+///   a registered pair (consistent with other config setters)
+/// - `get_pair_cooldown` defaults to 0 (disabled)
+/// - Cooldown 0 (disabled) allows back-to-back routes
+/// - First route always passes regardless of cooldown setting
+/// - Cooldown blocks a second route within the window (`RouteCooldownActive`)
+/// - Cooldown allows a route after the window elapses (ledger timestamp advance)
+/// - Cooldown is per-pair — independent cooldown states for different pairs
+/// - `set_pair_cooldown` emits a `cd_set` event
+/// - `compute_route_fee` stamps `PairLastRouteAt` which the cooldown gate reads
+#[cfg(test)]
+mod test_i165_cooldown_rate_limit {
+    use super::*;
+    use crate::test::event_payloads;
+    use soroban_sdk::{
+        symbol_short,
+        testutils::{Address as _, Ledger},
+    };
+
+    fn setup_pair(env: &Env) -> (StableRouteRouterClient<'_>, Symbol, Symbol) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let id = env.register(StableRouteRouter, (admin,));
+        let client = StableRouteRouterClient::new(env, &id);
+        let src = symbol_short!("USDC");
+        let dst = symbol_short!("EURC");
+        client.register_pair(&src, &dst);
+        (client, src, dst)
+    }
+
+    // --- set_pair_cooldown validation ---
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #20)")]
+    fn test_set_pair_cooldown_rejects_above_max() {
+        let env = Env::default();
+        let (client, src, dst) = setup_pair(&env);
+        client.set_pair_cooldown(&src, &dst, &(MAX_COOLDOWN_SECS + 1));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #5)")]
+    fn test_set_pair_cooldown_rejects_unregistered_pair() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let id = env.register(StableRouteRouter, (admin,));
+        let client = StableRouteRouterClient::new(&env, &id);
+        client.set_pair_cooldown(&symbol_short!("USDC"), &symbol_short!("EURC"), &60u64);
+    }
+
+    // --- get_pair_cooldown defaults ---
+
+    #[test]
+    fn test_get_pair_cooldown_defaults_to_zero() {
+        let env = Env::default();
+        let (client, src, dst) = setup_pair(&env);
+        assert_eq!(client.get_pair_cooldown(&src, &dst), 0);
+    }
+
+    #[test]
+    fn test_get_pair_cooldown_after_set() {
+        let env = Env::default();
+        let (client, src, dst) = setup_pair(&env);
+        client.set_pair_cooldown(&src, &dst, &120u64);
+        assert_eq!(client.get_pair_cooldown(&src, &dst), 120);
+    }
+
+    // --- cooldown disabled (0) allows back-to-back routes ---
+
+    #[test]
+    fn test_cooldown_zero_allows_immediate_reroute() {
+        let env = Env::default();
+        let (client, src, dst) = setup_pair(&env);
+        client.set_pair_fee_bps(&src, &dst, &10u32);
+        // Cooldown defaults to 0 (disabled).
+        let fee1 = client.compute_route_fee(&src, &dst, &1_000i128);
+        let fee2 = client.compute_route_fee(&src, &dst, &1_000i128);
+        assert_eq!(fee1, fee2);
+        assert_eq!(client.get_pair_route_count(&src, &dst), 2);
+    }
+
+    // --- first route always passes ---
+
+    #[test]
+    fn test_first_route_passes_with_cooldown_set() {
+        let env = Env::default();
+        let (client, src, dst) = setup_pair(&env);
+        client.set_pair_cooldown(&src, &dst, &3600u64);
+        // No prior route — no last_route_at timestamp — first call passes.
+        assert_eq!(client.compute_route_fee(&src, &dst, &500i128), 0);
+    }
+
+    // --- cooldown blocks immediate second route ---
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #17)")]
+    fn test_cooldown_blocks_second_route_within_window() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (client, src, dst) = setup_pair(&env);
+        client.set_pair_cooldown(&src, &dst, &100u64);
+        // First route succeeds, stamping last_route_at = 1_000.
+        client.compute_route_fee(&src, &dst, &500i128);
+        // Second route at same timestamp (t = 1_000) — cooldown not elapsed.
+        client.compute_route_fee(&src, &dst, &500i128);
+    }
+
+    // --- cooldown allows route after window elapses ---
+
+    #[test]
+    fn test_cooldown_allows_route_after_window_elapses() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (client, src, dst) = setup_pair(&env);
+        client.set_pair_cooldown(&src, &dst, &100u64);
+        // First route at t = 1_000.
+        client.compute_route_fee(&src, &dst, &500i128);
+        // Advance past the cooldown window.
+        env.ledger().set_timestamp(1_100);
+        // Second route at t = 1_100 — exactly at last + cooldown.
+        let fee = client.compute_route_fee(&src, &dst, &500i128);
+        assert_eq!(fee, 0);
+        assert_eq!(client.get_pair_route_count(&src, &dst), 2);
+    }
+
+    #[test]
+    fn test_cooldown_allows_route_well_after_window() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (client, src, dst) = setup_pair(&env);
+        client.set_pair_cooldown(&src, &dst, &100u64);
+        client.compute_route_fee(&src, &dst, &500i128);
+        // Advance far beyond the cooldown.
+        env.ledger().set_timestamp(9_999);
+        let fee = client.compute_route_fee(&src, &dst, &500i128);
+        assert_eq!(fee, 0);
+        assert_eq!(client.get_pair_route_count(&src, &dst), 2);
+    }
+
+    // --- cooldown is per-pair (independent state) ---
+
+    #[test]
+    fn test_cooldown_is_per_pair_independent() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let id = env.register(StableRouteRouter, (admin,));
+        let client = StableRouteRouterClient::new(&env, &id);
+
+        let src_a = symbol_short!("USDC");
+        let dst_a = symbol_short!("EURC");
+        let src_b = symbol_short!("XLM");
+        let dst_b = symbol_short!("USDC");
+
+        client.register_pair(&src_a, &dst_a);
+        client.register_pair(&src_b, &dst_b);
+        client.set_pair_cooldown(&src_a, &dst_a, &200u64);
+        client.set_pair_cooldown(&src_b, &dst_b, &200u64);
+
+        // Route pair A at t = 1_000.
+        client.compute_route_fee(&src_a, &dst_a, &100i128);
+        // Route pair B at t = 1_000 (different pair, independent cooldown).
+        client.compute_route_fee(&src_b, &dst_b, &100i128);
+
+        // Both should have last_route_at = 1_000.
+        assert_eq!(client.get_pair_last_route_at(&src_a, &dst_a), Some(1_000));
+        assert_eq!(client.get_pair_last_route_at(&src_b, &dst_b), Some(1_000));
+
+        // Advance by 100 — not enough for pair A (cooldown 200), but
+        // we can verify pair B also blocked at the same timestamp.
+        env.ledger().set_timestamp(1_100);
+        let err_a = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.compute_route_fee(&src_a, &dst_a, &100i128);
+        }));
+        assert!(err_a.is_err(), "pair A should still be in cooldown");
+
+        let err_b = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.compute_route_fee(&src_b, &dst_b, &100i128);
+        }));
+        assert!(err_b.is_err(), "pair B should still be in cooldown");
+
+        // Advance to t = 1_200 — exactly at last + cooldown for both.
+        env.ledger().set_timestamp(1_200);
+        client.compute_route_fee(&src_a, &dst_a, &200i128);
+        client.compute_route_fee(&src_b, &dst_b, &200i128);
+        assert_eq!(client.get_pair_route_count(&src_a, &dst_a), 2);
+        assert_eq!(client.get_pair_route_count(&src_b, &dst_b), 2);
+    }
+
+    // --- set_pair_cooldown emits cd_set event ---
+
+    #[test]
+    fn test_set_pair_cooldown_emits_event() {
+        let env = Env::default();
+        let (client, src, dst) = setup_pair(&env);
+        client.set_pair_cooldown(&src, &dst, &300u64);
+        let payloads = event_payloads(&env, symbol_short!("cd_set"));
+        assert_eq!(
+            payloads.len(),
+            1,
+            "set_pair_cooldown emits exactly one cd_set event"
+        );
+        let decoded: (Symbol, Symbol, u64) =
+            soroban_sdk::TryFromVal::try_from_val(&env, &payloads[0])
+                .expect("cd_set event data decodes to (Symbol, Symbol, u64)");
+        assert_eq!(decoded, (src, dst, 300u64));
+    }
+
+    // --- compute_route_fee stamps last_route_at after route ---
+
+    #[test]
+    fn test_cooldown_stamps_last_route_at() {
+        let env = Env::default();
+        env.ledger().set_timestamp(42_000);
+        let (client, src, dst) = setup_pair(&env);
+        client.set_pair_cooldown(&src, &dst, &500u64);
+        assert_eq!(client.get_pair_last_route_at(&src, &dst), None);
+        client.compute_route_fee(&src, &dst, &1_000i128);
+        assert_eq!(client.get_pair_last_route_at(&src, &dst), Some(42_000));
+    }
+
+    // --- cooldown respects exact boundary (last + cooldown == timestamp) ---
+
+    #[test]
+    fn test_cooldown_boundary_at_last_plus_cooldown() {
+        let env = Env::default();
+        env.ledger().set_timestamp(5_000);
+        let (client, src, dst) = setup_pair(&env);
+        client.set_pair_cooldown(&src, &dst, &300u64);
+        client.compute_route_fee(&src, &dst, &100i128);
+        // At t = 5_299, still in cooldown (5_000 + 300 = 5_300).
+        env.ledger().set_timestamp(5_299);
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.compute_route_fee(&src, &dst, &100i128);
+        }));
+        assert!(err.is_err(), "should be blocked at t = last + cooldown - 1");
+
+        // At t = 5_300, exactly at the boundary: allowed.
+        env.ledger().set_timestamp(5_300);
+        client.compute_route_fee(&src, &dst, &100i128);
+        assert_eq!(client.get_pair_route_count(&src, &dst), 2);
+    }
+
+    // ------------------------------------------------------------------
+    //  Savings data model tests (Issue #298)
+    // ------------------------------------------------------------------
+
+    fn setup_savings(env: &Env) -> (StableRouteRouterClient<'_>, Address) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let id = env.register(StableRouteRouter, (admin.clone(),));
+        let client = StableRouteRouterClient::new(env, &id);
+        client.init_savings(&100u32); // 1 % annual yield
+        (client, admin)
+    }
+
+    // --- init_savings ---
+
+    #[test]
+    fn test_init_savings_sets_config() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let id = env.register(StableRouteRouter, (admin,));
+        let client = StableRouteRouterClient::new(&env, &id);
+
+        client.init_savings(&250u32);
+        let config = client
+            .get_savings_config()
+            .expect("savings config should be Some after init");
+        assert_eq!(config.yield_rate_bps, 250);
+        assert_eq!(config.total_principal, 0);
+        assert_eq!(config.total_yield, 0);
+        assert!(config.initialized);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #23)")]
+    fn test_init_savings_rejects_double_init() {
+        let env = Env::default();
+        let (client, _admin) = setup_savings(&env);
+        client.init_savings(&200u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #24)")]
+    fn test_init_savings_rejects_rate_too_high() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let id = env.register(StableRouteRouter, (admin,));
+        let client = StableRouteRouterClient::new(&env, &id);
+        client.init_savings(&(MAX_YIELD_RATE_BPS + 1));
+    }
+
+    #[test]
+    fn test_init_savings_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let id = env.register(StableRouteRouter, (admin,));
+        let client = StableRouteRouterClient::new(&env, &id);
+
+        client.init_savings(&500u32);
+        let payloads = event_payloads(&env, symbol_short!("sv_init"));
+        assert_eq!(
+            payloads.len(),
+            1,
+            "init_savings emits exactly one sv_init event"
+        );
+        let decoded: u32 = soroban_sdk::TryFromVal::try_from_val(&env, &payloads[0])
+            .expect("sv_init event data decodes to u32");
+        assert_eq!(decoded, 500u32);
+    }
+
+    // --- get_savings_config ---
+
+    #[test]
+    fn test_get_savings_config_none_before_init() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let id = env.register(StableRouteRouter, (admin,));
+        let client = StableRouteRouterClient::new(&env, &id);
+        assert_eq!(client.get_savings_config(), None);
+    }
+
+    // --- deposit_savings ---
+
+    #[test]
+    fn test_deposit_savings_creates_account() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+
+        client.deposit_savings(&user, &1_000i128);
+        let info = client
+            .get_savings_info(&user)
+            .expect("savings info should be Some after deposit");
+        assert_eq!(info.principal, 1_000);
+        assert_eq!(info.yield_earned, 0);
+        assert_eq!(info.last_accrued, 1_000_000);
+
+        let config = client
+            .get_savings_config()
+            .expect("savings config should be Some");
+        assert_eq!(config.total_principal, 1_000);
+        assert_eq!(config.total_yield, 0);
+    }
+
+    #[test]
+    fn test_deposit_savings_multiple_deposits() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+
+        client.deposit_savings(&user, &500i128);
+        client.deposit_savings(&user, &1_500i128);
+        let info = client
+            .get_savings_info(&user)
+            .expect("savings info should be Some");
+        assert_eq!(info.principal, 2_000);
+        assert_eq!(info.yield_earned, 0);
+    }
+
+    #[test]
+    fn test_deposit_savings_tracks_global_total() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let (client, _admin) = setup_savings(&env);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.deposit_savings(&alice, &2_000i128);
+        client.deposit_savings(&bob, &3_000i128);
+        let config = client.get_savings_config().expect("config exists");
+        assert_eq!(config.total_principal, 5_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #25)")]
+    fn test_deposit_savings_rejects_zero() {
+        let env = Env::default();
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+        client.deposit_savings(&user, &0i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #25)")]
+    fn test_deposit_savings_rejects_negative() {
+        let env = Env::default();
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+        client.deposit_savings(&user, &(-100i128));
+    }
+
+    #[test]
+    fn test_deposit_savings_emits_event() {
+        let env = Env::default();
+        env.ledger().set_timestamp(2_000_000);
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+
+        client.deposit_savings(&user, &10_000i128);
+        let payloads = event_payloads(&env, symbol_short!("sv_dep"));
+        assert_eq!(
+            payloads.len(),
+            1,
+            "deposit_savings emits exactly one sv_dep event"
+        );
+        let decoded: (Address, i128, i128) =
+            soroban_sdk::TryFromVal::try_from_val(&env, &payloads[0])
+                .expect("sv_dep event data decodes to (Address, i128, i128)");
+        assert_eq!(decoded.0, user);
+        assert_eq!(decoded.1, 10_000i128);
+        assert_eq!(decoded.2, 10_000i128);
+    }
+
+    // --- get_savings_info ---
+
+    #[test]
+    fn test_get_savings_info_returns_none_for_unknown_user() {
+        let env = Env::default();
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+        assert_eq!(client.get_savings_info(&user), None);
+    }
+
+    #[test]
+    fn test_get_savings_info_shows_accrued_yield_without_writing() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+
+        client.deposit_savings(&user, &1_000_000i128);
+
+        // Advance one full year at 1 % (100 bps).
+        env.ledger().set_timestamp(1_000_000 + YEAR_SECS as u64);
+
+        // Read-only view should compute yield = 1M * 100 / 10_000 = 10_000.
+        let info = client.get_savings_info(&user).expect("info should be Some");
+        assert_eq!(info.yield_earned, 10_000);
+        assert_eq!(info.principal, 1_000_000);
+        assert_eq!(info.last_accrued, 1_000_000 + YEAR_SECS as u64);
+
+        // A second read at the same timestamp returns the same value (no double accrual).
+        let info2 = client.get_savings_info(&user).expect("info exists");
+        assert_eq!(info2.yield_earned, 10_000);
+
+        // Now persist via accrue_yield at same timestamp. Since read-only
+        // view does NOT write storage, the stored last_accrued is still
+        // the deposit timestamp.  Calling accrue_yield now should produce
+        // the same increment as the read-only view.
+        client.accrue_yield(&user);
+
+        // After persistence, a read should match.
+        let info3 = client.get_savings_info(&user).expect("info exists");
+        assert_eq!(info3.yield_earned, 10_000);
+        assert_eq!(info3.last_accrued, 1_000_000 + YEAR_SECS as u64);
+    }
+
+    // --- withdraw_savings ---
+
+    #[test]
+    fn test_withdraw_savings_from_yield_first() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+
+        client.deposit_savings(&user, &10_000i128);
+        // Advance one year so yield = 10_000 * 100 / 10_000 = 100 (at 1 % = 100 bps)
+        env.ledger().set_timestamp(1_000_000 + YEAR_SECS as u64);
+
+        // Withdraw 50 — should come entirely from yield since yield=100.
+        client.withdraw_savings(&user, &50i128);
+        let info = client
+            .get_savings_info(&user)
+            .expect("info exists after partial withdraw");
+        assert_eq!(info.principal, 10_000);
+        assert_eq!(info.yield_earned, 50); // 100 - 50
+    }
+
+    #[test]
+    fn test_withdraw_savings_dips_into_principal_when_yield_exhausted() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+
+        client.deposit_savings(&user, &10_000i128);
+        // Advance one year so yield = 100.
+        env.ledger().set_timestamp(1_000_000 + YEAR_SECS as u64);
+
+        // Withdraw 200 — 100 from yield, 100 from principal.
+        client.withdraw_savings(&user, &200i128);
+        let info = client
+            .get_savings_info(&user)
+            .expect("info exists after withdraw");
+        assert_eq!(info.principal, 9_900); // 10_000 - 100
+        assert_eq!(info.yield_earned, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #22)")]
+    fn test_withdraw_savings_rejects_exceeding_balance() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+
+        client.deposit_savings(&user, &100i128);
+        client.withdraw_savings(&user, &101i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #22)")]
+    fn test_withdraw_savings_rejects_no_account() {
+        let env = Env::default();
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+        client.withdraw_savings(&user, &1i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #25)")]
+    fn test_withdraw_savings_rejects_zero() {
+        let env = Env::default();
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+        client.deposit_savings(&user, &100i128);
+        client.withdraw_savings(&user, &0i128);
+    }
+
+    #[test]
+    fn test_withdraw_savings_drains_full_and_removes_slot() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+
+        client.deposit_savings(&user, &5_000i128);
+        // Withdraw exactly the full balance (principal only, no yield elapsed).
+        client.withdraw_savings(&user, &5_000i128);
+        assert_eq!(
+            client.get_savings_info(&user),
+            None,
+            "slot should be removed after full drain"
+        );
+        let config = client.get_savings_config().expect("config exists");
+        assert_eq!(config.total_principal, 0);
+        assert_eq!(config.total_yield, 0);
+    }
+
+    #[test]
+    fn test_withdraw_savings_emits_event() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+
+        client.deposit_savings(&user, &10_000i128);
+        env.ledger().set_timestamp(1_000_000 + YEAR_SECS as u64);
+        client.withdraw_savings(&user, &150i128);
+
+        let payloads = event_payloads(&env, symbol_short!("sv_wd"));
+        assert_eq!(
+            payloads.len(),
+            1,
+            "withdraw_savings emits exactly one sv_wd event"
+        );
+        // (user, amount, remaining_principal, remaining_yield)
+        let decoded: (Address, i128, i128, i128) =
+            soroban_sdk::TryFromVal::try_from_val(&env, &payloads[0])
+                .expect("sv_wd event decodes to (Address, i128, i128, i128)");
+        assert_eq!(decoded.0, user);
+        assert_eq!(decoded.1, 150);
+        // yield = 100, so 150 withdraw = 100 yield + 50 principal
+        assert_eq!(decoded.2, 9_950); // remaining principal
+        assert_eq!(decoded.3, 0); // remaining yield
+    }
+
+    // --- accrue_yield ---
+
+    #[test]
+    fn test_accrue_yield_persists_correct_increment() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+
+        client.deposit_savings(&user, &1_000_000i128);
+        // Advance exactly one year.
+        env.ledger().set_timestamp(1_000_000 + YEAR_SECS as u64);
+
+        client.accrue_yield(&user);
+        let info = client
+            .get_savings_info(&user)
+            .expect("info exists after accrual");
+        assert_eq!(info.yield_earned, 10_000); // 1M * 1% = 10_000
+        assert_eq!(info.last_accrued, 1_000_000 + YEAR_SECS as u64);
+    }
+
+    #[test]
+    fn test_accrue_yield_multiple_periods() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+
+        client.deposit_savings(&user, &1_000_000i128);
+        // Advance one year and accrue.
+        env.ledger().set_timestamp(1_000_000 + YEAR_SECS as u64);
+        client.accrue_yield(&user);
+
+        // Another year passes.
+        env.ledger().set_timestamp(1_000_000 + 2 * YEAR_SECS as u64);
+        client.accrue_yield(&user);
+
+        let info = client.get_savings_info(&user).expect("info exists");
+        assert_eq!(info.yield_earned, 20_000); // 2 years at 1%
+        assert_eq!(info.last_accrued, 1_000_000 + 2 * YEAR_SECS as u64);
+    }
+
+    #[test]
+    fn test_accrue_yield_updates_global_total_yield() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let (client, _admin) = setup_savings(&env);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.deposit_savings(&alice, &2_000_000i128);
+        client.deposit_savings(&bob, &3_000_000i128);
+        env.ledger().set_timestamp(1_000_000 + YEAR_SECS as u64);
+
+        client.accrue_yield(&alice);
+        let config = client.get_savings_config().expect("config exists");
+        assert_eq!(config.total_yield, 20_000); // 2M * 1% = 20_000
+
+        client.accrue_yield(&bob);
+        let config = client.get_savings_config().expect("config exists");
+        assert_eq!(config.total_yield, 50_000); // 20_000 + 3M * 1% = 50_000
+    }
+
+    #[test]
+    fn test_accrue_yield_noop_on_unknown_user() {
+        let env = Env::default();
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+        // Should not panic.
+        client.accrue_yield(&user);
+    }
+
+    #[test]
+    fn test_accrue_yield_noop_when_time_not_advanced() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+
+        client.deposit_savings(&user, &1_000_000i128);
+        // Accrue at t=1_000_000 — deposit already set last_accrued to this,
+        // so now == last_accrued → should be a no-op.
+        client.accrue_yield(&user);
+        let info = client.get_savings_info(&user).expect("info exists");
+        assert_eq!(info.yield_earned, 0);
+        assert_eq!(info.last_accrued, 1_000_000);
+    }
+
+    #[test]
+    fn test_accrue_yield_emits_event() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+
+        client.deposit_savings(&user, &1_000_000i128);
+        env.ledger().set_timestamp(1_000_000 + YEAR_SECS as u64);
+
+        client.accrue_yield(&user);
+        let payloads = event_payloads(&env, symbol_short!("sv_acc"));
+        assert_eq!(
+            payloads.len(),
+            1,
+            "accrue_yield emits exactly one sv_acc event"
+        );
+        let decoded: (Address, i128, i128) =
+            soroban_sdk::TryFromVal::try_from_val(&env, &payloads[0])
+                .expect("sv_acc event decodes to (Address, i128, i128)");
+        assert_eq!(decoded.0, user);
+        assert_eq!(decoded.1, 10_000); // yield increment
+        assert_eq!(decoded.2, 10_000); // global total_yield after
+    }
+
+    // --- set_yield_rate ---
+
+    #[test]
+    fn test_set_yield_rate_updates_config() {
+        let env = Env::default();
+        let (client, _admin) = setup_savings(&env);
+        client.set_yield_rate(&200u32); // 2 %
+        let config = client
+            .get_savings_config()
+            .expect("config exists after set_yield_rate");
+        assert_eq!(config.yield_rate_bps, 200);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #24)")]
+    fn test_set_yield_rate_rejects_too_high() {
+        let env = Env::default();
+        let (client, _admin) = setup_savings(&env);
+        client.set_yield_rate(&(MAX_YIELD_RATE_BPS + 1));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #21)")]
+    fn test_set_yield_rate_rejects_uninitialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let id = env.register(StableRouteRouter, (admin,));
+        let client = StableRouteRouterClient::new(&env, &id);
+        client.set_yield_rate(&100u32);
+    }
+
+    #[test]
+    fn test_set_yield_rate_emits_event() {
+        let env = Env::default();
+        let (client, _admin) = setup_savings(&env);
+        client.set_yield_rate(&300u32);
+        let payloads = event_payloads(&env, symbol_short!("yield_set"));
+        assert_eq!(
+            payloads.len(),
+            1,
+            "set_yield_rate emits exactly one yield_set event"
+        );
+        let decoded: u32 = soroban_sdk::TryFromVal::try_from_val(&env, &payloads[0])
+            .expect("yield_set event data decodes to u32");
+        assert_eq!(decoded, 300u32);
+    }
+
+    // --- accrue_yield updates last_accrued (no double-accrual) ---
+
+    #[test]
+    fn test_accrue_yield_then_get_savings_info_no_double_accrual() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+
+        client.deposit_savings(&user, &1_000_000i128);
+        env.ledger().set_timestamp(1_000_000 + YEAR_SECS as u64);
+        client.accrue_yield(&user); // persists yield = 10_000
+                                    // Immediately read back — should show same value.
+        let info = client.get_savings_info(&user).expect("info exists");
+        assert_eq!(info.yield_earned, 10_000);
+        assert_eq!(info.last_accrued, 1_000_000 + YEAR_SECS as u64);
+    }
+
+    // --- withdraw after deposit accrues yield automatically ---
+
+    #[test]
+    fn test_deposit_accrues_yield_automatically() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+
+        // Deposit 1M, let time pass.
+        client.deposit_savings(&user, &1_000_000i128);
+        env.ledger().set_timestamp(1_000_000 + YEAR_SECS as u64);
+
+        // A second deposit should first accrue year 1 yield, then add principal.
+        client.deposit_savings(&user, &500_000i128);
+        let info = client.get_savings_info(&user).expect("info exists");
+        assert_eq!(info.yield_earned, 10_000); // yield on first 1M for 1 year
+        assert_eq!(info.principal, 1_500_000); // 1M + 500k
+        assert_eq!(info.last_accrued, 1_000_000 + YEAR_SECS as u64);
+    }
+
+    // --- principal / yield separation invariant ---
+
+    #[test]
+    fn test_principal_never_decreases_from_yield_accrual() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+
+        client.deposit_savings(&user, &1_000i128);
+        let principal_before = client.get_savings_info(&user).unwrap().principal;
+
+        env.ledger().set_timestamp(1_000_000 + YEAR_SECS as u64);
+        client.accrue_yield(&user);
+
+        let info = client.get_savings_info(&user).unwrap();
+        assert_eq!(
+            info.principal, principal_before,
+            "yield accrual must never modify principal"
+        );
+        assert!(
+            info.yield_earned > 0,
+            "yield should be positive after a year"
+        );
+    }
+
+    #[test]
+    fn test_yield_earned_monotonic() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let (client, _admin) = setup_savings(&env);
+        let user = Address::generate(&env);
+
+        client.deposit_savings(&user, &1_000_000i128);
+
+        // Accrue at t=1 (1 sec after deposit).
+        env.ledger().set_timestamp(1_000_001);
+        client.accrue_yield(&user);
+        let yield_t1 = client.get_savings_info(&user).unwrap().yield_earned;
+
+        // Accrue at t=year.
+        env.ledger().set_timestamp(1_000_000 + YEAR_SECS as u64);
+        client.accrue_yield(&user);
+        let yield_t2 = client.get_savings_info(&user).unwrap().yield_earned;
+
+        assert!(yield_t2 > yield_t1, "yield should be strictly monotonic");
     }
 }
